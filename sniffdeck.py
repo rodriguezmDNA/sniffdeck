@@ -17,16 +17,21 @@ logging.basicConfig(
 
 load_dotenv()
 
-parser = argparse.ArgumentParser(description="Steam Deck Refurbished stock watcher")
+parser = argparse.ArgumentParser(description="Steam Deck stock watcher")
 parser.add_argument("--interval", type=int, help="Check interval in seconds (overrides .env)")
 parser.add_argument("--verbose", action="store_true", help="Send Telegram message on every check, not just when in stock")
-parser.add_argument("--debug", action="store_true", help="Send the in-stock alert every 10s regardless of actual stock status")
+parser.add_argument("--debug", action="store_true", help="Send a fake in-stock alert every 10s to test Telegram integration")
 args = parser.parse_args()
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 CHECK_INTERVAL = args.interval or int(os.getenv("CHECK_INTERVAL_SECONDS", 300))
-URL = "https://store.steampowered.com/sale/steamdeckrefurbished/"
+
+TARGETS = [
+    {"name": "Steam Deck Refurbished", "url": "https://store.steampowered.com/sale/steamdeckrefurbished/"},
+    {"name": "Steam Deck OLED 512GB",  "url": "https://store.steampowered.com/steamdeck", "sku_label": "512GB OLED"},
+    {"name": "Steam Deck OLED 1TB",    "url": "https://store.steampowered.com/steamdeck", "sku_label": "1TB OLED"},
+]
 
 # Selectors that indicate the item is purchasable
 ADD_TO_CART_SELECTORS = [
@@ -86,9 +91,9 @@ def poll_commands():
             time.sleep(5)
 
 
-def check_availability(page) -> bool:
-    print(f"[sniffer] Fetching {URL} ...")
-    response = page.goto(URL, wait_until="networkidle", timeout=60_000)
+def check_availability(page, url: str, sku_label: str = None) -> bool:
+    print(f"[sniffer] Fetching {url} ...")
+    response = page.goto(url, wait_until="networkidle", timeout=60_000)
 
     # Check HTTP status
     if response and response.status == 404:
@@ -109,7 +114,22 @@ def check_availability(page) -> bool:
     except Exception:
         pass  # No age gate, carry on
 
-    # Check for "Add to Cart" button
+    # SKU-specific check: find the reservation_ctn for this model and check its button
+    if sku_label:
+        containers = page.locator(".reservation_ctn").all()
+        for ctn in containers:
+            try:
+                if sku_label.lower() in ctn.inner_text().lower():
+                    disabled = ctn.locator(".Disabled").count()
+                    out_of_stock = "out of stock" in ctn.inner_text().lower()
+                    available = not disabled and not out_of_stock
+                    print(f"[sniffer] {sku_label}: {'AVAILABLE' if available else 'out of stock'}")
+                    return available
+            except Exception:
+                continue
+        raise RuntimeError(f"Could not find SKU container for {sku_label!r} — page structure may have changed.")
+
+    # Generic check: look for any "Add to Cart" button
     for selector in ADD_TO_CART_SELECTORS:
         try:
             element = page.locator(selector).first
@@ -119,7 +139,7 @@ def check_availability(page) -> bool:
         except Exception:
             continue
 
-    # Fallback: check page text for stock-related phrases
+    # Fallback: check page text
     if "add to cart" in content:
         print("[sniffer] AVAILABLE — 'add to cart' found in page source.")
         return True
@@ -129,8 +149,13 @@ def check_availability(page) -> bool:
 
 
 def main():
-    print(f"[sniffer] Starting Steam Deck Refurbished watcher (interval: {CHECK_INTERVAL}s)")
-    send_telegram("SniffDeck is online. Watching for Steam Deck Refurbished stock...\nSend /check to trigger an immediate check.")
+    target_names = " & ".join(t["name"] for t in TARGETS)
+    print(f"[sniffer] Starting watcher for: {target_names} (interval: {CHECK_INTERVAL}s)")
+    send_telegram(
+        f"SniffDeck is online. Watching:\n"
+        + "\n".join(f"• {t['name']}" for t in TARGETS)
+        + "\n\nSend /check to trigger an immediate check."
+    )
 
     # Start command listener in background
     t = threading.Thread(target=poll_commands, daemon=True)
@@ -147,59 +172,70 @@ def main():
         )
         page = context.new_page()
 
-        already_notified = False
-        last_error = None  # track last error to avoid spamming repeats
+        # Per-target state
+        state = {t["name"]: {"already_notified": False, "last_error": None} for t in TARGETS}
 
         while True:
             try:
                 if args.debug:
-                    send_telegram(
-                        "*[DEBUG] Steam Deck Refurbished is IN STOCK!*\n"
-                        f"[Buy now →]({URL})"
-                    )
-                    print(f"[debug] Sent test alert. Next in 10s ...\n")
+                    for target in TARGETS:
+                        send_telegram(
+                            f"*[DEBUG] {target['name']} is IN STOCK!*\n"
+                            f"[Buy now →]({target['url']})"
+                        )
+                    print(f"[debug] Sent test alerts. Next in 10s ...\n")
                     time.sleep(10)
                     continue
 
-                available = check_availability(page)
-                if last_error is not None:
-                    send_telegram("✅ SniffDeck recovered — back to watching.")
-                last_error = None  # clear error state on successful check
-
                 is_manual = manual_check.is_set()
                 manual_check.clear()
-
                 checked_at = datetime.now(ZoneInfo("America/Los_Angeles")).strftime("%y-%m-%d %Hh%M'%S\"")
+                manual_results = []
 
-                if available and not already_notified:
+                for target in TARGETS:
+                    name, url = target["name"], target["url"]
+                    s = state[name]
+                    try:
+                        available = check_availability(page, url, target.get("sku_label"))
+
+                        if s["last_error"] is not None:
+                            send_telegram(f"✅ *{name}* monitor recovered — back to watching.")
+                        s["last_error"] = None
+
+                        if available and not s["already_notified"]:
+                            send_telegram(
+                                f"*{name} is IN STOCK!*\n"
+                                f"[Buy now →]({url})\n"
+                                f"_Checked: {checked_at}_"
+                            )
+                            s["already_notified"] = True
+                        elif not available:
+                            s["already_notified"] = False
+                            if is_manual or args.verbose:
+                                manual_results.append(f"• {name}: out of stock")
+
+                    except Exception as e:
+                        err_msg = str(e)
+                        logging.error("[sniffer] Error checking %s: %s", name, err_msg)
+                        if err_msg != s["last_error"]:
+                            send_telegram(f"⚠️ *{name} error:*\n`{err_msg}`\nI'll keep retrying.")
+                            s["last_error"] = err_msg
+                        else:
+                            logging.info("[sniffer] Same error as last check for %s, skipping repeat alert.", name)
+                        try:
+                            page = context.new_page()
+                        except Exception:
+                            pass
+
+                if manual_results:
                     send_telegram(
-                        "*Steam Deck Refurbished is IN STOCK!*\n"
-                        f"[Buy now →]({URL})\n"
-                        f"_Checked: {checked_at}_"
+                        "Still out of stock. I'll keep watching.\n"
+                        + "\n".join(manual_results)
+                        + f"\n_Checked: {checked_at}_"
                     )
-                    already_notified = True
-                elif not available:
-                    if is_manual or args.verbose:
-                        send_telegram(
-                            f"Still out of stock. I'll keep watching.\n"
-                            f"_Checked: {checked_at}_"
-                        )
-                    # Reset so we alert again if it comes back in stock
-                    already_notified = False
 
             except Exception as e:
-                err_msg = str(e)
-                logging.error("[sniffer] Error during check: %s", err_msg)
-                if err_msg != last_error:
-                    send_telegram(f"⚠️ *SniffDeck error:*\n`{err_msg}`\nI'll keep retrying.")
-                    last_error = err_msg
-                else:
-                    logging.info("[sniffer] Same error as last check, skipping repeat alert.")
-                # Reload the page context on errors
-                try:
-                    page = context.new_page()
-                except Exception:
-                    pass
+                logging.error("[sniffer] Unexpected error: %s", e)
 
             # Wait for interval OR an early /check trigger
             triggered = check_now.wait(timeout=CHECK_INTERVAL)
