@@ -161,19 +161,24 @@ def main():
     t = threading.Thread(target=poll_commands, daemon=True)
     t.start()
 
+    BROWSER_ARGS = ["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"]
+
+    # Per-target state (persists across browser restarts)
+    state = {t["name"]: {"already_notified": False, "last_error": None} for t in TARGETS}
+
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        context = browser.new_context(
-            user_agent=(
+
+        def make_browser():
+            b = p.chromium.launch(headless=True, args=BROWSER_ARGS)
+            ctx = b.new_context(user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
                 "Chrome/120.0.0.0 Safari/537.36"
-            )
-        )
-        page = context.new_page()
+            ))
+            logging.info("[browser] New browser context created.")
+            return b, ctx
 
-        # Per-target state
-        state = {t["name"]: {"already_notified": False, "last_error": None} for t in TARGETS}
+        browser, context = make_browser()
 
         while True:
             try:
@@ -195,7 +200,9 @@ def main():
                 for target in TARGETS:
                     name, url = target["name"], target["url"]
                     s = state[name]
+                    page = None
                     try:
+                        page = context.new_page()
                         available = check_availability(page, url, target.get("sku_label"))
 
                         if s["last_error"] is not None:
@@ -222,10 +229,22 @@ def main():
                             s["last_error"] = err_msg
                         else:
                             logging.info("[sniffer] Same error as last check for %s, skipping repeat alert.", name)
+                        # If browser is dead, restart it entirely
                         try:
-                            page = context.new_page()
+                            browser.version()  # lightweight liveness check
                         except Exception:
-                            pass
+                            logging.warning("[browser] Browser unreachable — restarting.")
+                            try:
+                                browser.close()
+                            except Exception:
+                                pass
+                            browser, context = make_browser()
+                    finally:
+                        if page is not None:
+                            try:
+                                page.close()
+                            except Exception:
+                                pass
 
                 if manual_results:
                     send_telegram(
